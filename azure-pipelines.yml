@@ -142,7 +142,7 @@ stages:
 
           # --- Tag and push Docker image to ECR ---
           - script: |
-              ECR_URI=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com/$(projectName)-$(environment)
+              ECR_URI=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com/$(projectName)
 
               docker tag $(projectName):$(imageTag) ${ECR_URI}:$(imageTag)
               docker tag $(projectName):latest ${ECR_URI}:latest
