@@ -524,15 +524,16 @@ stages:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
 
+          # --- Step 1: Apply ECR module first to ensure prod ECR repo exists ---
           - script: |
               cd terraform
-              terraform apply -auto-approve -input=false tfplan
-            displayName: 'Terraform Apply'
+              terraform apply -auto-approve -input=false -target=module.ecr tfplan
+            displayName: 'Terraform Apply - ECR only'
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
 
-          # --- Copy image from dev ECR to prod ECR (after Terraform creates the prod ECR repo) ---
+          # --- Step 2: Copy image from dev ECR to prod ECR ---
           - script: |
               echo "Copying image from dev ECR to prod ECR..."
               ECR_BASE=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com
@@ -549,6 +550,17 @@ stages:
               docker push ${PROD_ECR}:$(imageTag)
               echo "Copied ${DEV_ECR}:$(imageTag) -> ${PROD_ECR}:$(imageTag)"
             displayName: 'Copy image from dev ECR to prod ECR'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Step 3: Apply remaining infrastructure (ECS, networking, etc.) ---
+          - script: |
+              cd terraform
+              terraform apply -auto-approve -input=false \
+                -var-file="environments/$(environment).tfvars" \
+                -var="image_tag=$(imageTag)"
+            displayName: 'Terraform Apply - Full'
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
