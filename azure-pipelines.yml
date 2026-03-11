@@ -1,0 +1,643 @@
+###############################################################################
+# Azure DevOps CI/CD Pipeline
+# Automates build, infrastructure provisioning, and deployment to AWS ECS
+###############################################################################
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - app/**
+      - Dockerfile
+      - terraform/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  # Pipeline-level variables (non-sensitive)
+  # Sensitive variables (AWS credentials) should be stored in Azure DevOps
+  # Variable Groups or Key Vault-backed variable groups
+  - group: aws-credentials  # Variable group containing AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ACCOUNT_ID
+
+  # Application settings
+  - name: projectName
+    value: 'hello-world-ecs'
+  - name: awsRegion
+    value: 'us-east-1'
+  - name: containerPort
+    value: '5000'
+  - name: pythonVersion
+    value: '3.12'
+
+  # Environment-specific (overridden per stage)
+  - name: environment
+    value: 'dev'
+
+  # Terraform settings
+  - name: tfVersion
+    value: '1.7.0'
+  - name: tfBackendBucket
+    value: '$(projectName)-terraform-state'
+  - name: tfBackendKey
+    value: '$(environment)/terraform.tfstate'
+  - name: tfBackendDynamoDBTable
+    value: '$(projectName)-terraform-locks'
+
+  # Docker image settings
+  - name: imageTag
+    value: '$(Build.BuildId)'
+
+stages:
+  ##############################################################################
+  # Stage 1: BUILD - Build and validate application and Docker image
+  ##############################################################################
+  - stage: Build
+    displayName: 'Build & Test'
+    jobs:
+      - job: BuildAndTest
+        displayName: 'Build, Test & Push Docker Image'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # --- Checkout source code ---
+          - checkout: self
+            displayName: 'Checkout source code'
+            clean: true
+
+          # --- Set up Python ---
+          - task: UsePythonVersion@0
+            displayName: 'Set up Python $(pythonVersion)'
+            inputs:
+              versionSpec: '$(pythonVersion)'
+              addToPath: true
+
+          # --- Install Python dependencies ---
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r app/requirements.txt
+              pip install pytest flake8 safety
+            displayName: 'Install Python dependencies'
+
+          # --- Lint Python code ---
+          - script: |
+              flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
+              flake8 app/ --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+            displayName: 'Lint Python code'
+
+          # --- Run unit tests ---
+          - script: |
+              cd app && python -m pytest tests/ -v --junitxml=../test-results.xml
+            displayName: 'Run unit tests'
+
+          # --- Publish test results ---
+          - task: PublishTestResults@2
+            displayName: 'Publish test results'
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/test-results.xml'
+              failTaskOnFailedTests: true
+
+          # --- Security scan on dependencies ---
+          - script: |
+              pip install safety
+              safety check -r app/requirements.txt --output text || true
+            displayName: 'Security scan - Dependencies'
+
+          # --- Configure AWS credentials ---
+          - script: |
+              aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
+              aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+              aws configure set default.region $(awsRegion)
+            displayName: 'Configure AWS CLI'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Login to Amazon ECR ---
+          - script: |
+              aws ecr get-login-password --region $(awsRegion) | \
+                docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com
+            displayName: 'Login to Amazon ECR'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Build Docker image ---
+          - script: |
+              docker build \
+                --tag $(projectName):$(imageTag) \
+                --tag $(projectName):latest \
+                --build-arg APP_VERSION=$(imageTag) \
+                --file Dockerfile \
+                .
+            displayName: 'Build Docker image'
+
+          # --- Tag and push Docker image to ECR ---
+          - script: |
+              ECR_URI=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com/$(projectName)-$(environment)
+
+              docker tag $(projectName):$(imageTag) ${ECR_URI}:$(imageTag)
+              docker tag $(projectName):latest ${ECR_URI}:latest
+
+              docker push ${ECR_URI}:$(imageTag)
+              docker push ${ECR_URI}:latest
+
+              echo "##vso[task.setvariable variable=ecrImageUri;isOutput=true]${ECR_URI}:$(imageTag)"
+            displayName: 'Tag & Push image to ECR'
+            name: pushImage
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Scan Docker image for vulnerabilities ---
+          - script: |
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy:latest image \
+                --severity HIGH,CRITICAL \
+                --exit-code 0 \
+                $(projectName):$(imageTag) || true
+            displayName: 'Security scan - Docker image'
+            continueOnError: true
+
+  ##############################################################################
+  # Stage 2: INFRASTRUCTURE (Dev) - Provision AWS resources with Terraform
+  ##############################################################################
+  - stage: Infrastructure_Dev
+    displayName: 'Infrastructure - Dev'
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    variables:
+      environment: 'dev'
+    jobs:
+      - job: TerraformValidate
+        displayName: 'Terraform Validate & Plan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          # --- Install Terraform ---
+          - script: |
+              curl -fsSL https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip -o terraform.zip
+              unzip -o terraform.zip
+              sudo mv terraform /usr/local/bin/
+              terraform --version
+            displayName: 'Install Terraform $(tfVersion)'
+
+          # --- Terraform Init ---
+          - script: |
+              cd terraform
+              terraform init \
+                -backend-config="bucket=$(tfBackendBucket)" \
+                -backend-config="key=$(environment)/terraform.tfstate" \
+                -backend-config="region=$(awsRegion)" \
+                -backend-config="dynamodb_table=$(tfBackendDynamoDBTable)" \
+                -backend-config="encrypt=true"
+            displayName: 'Terraform Init'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Terraform Validate ---
+          - script: |
+              cd terraform
+              terraform validate
+            displayName: 'Terraform Validate'
+
+          # --- Terraform Format Check ---
+          - script: |
+              cd terraform
+              terraform fmt -check -recursive
+            displayName: 'Terraform Format Check'
+
+          # --- Terraform Plan ---
+          - script: |
+              cd terraform
+              terraform plan \
+                -var-file="environments/$(environment).tfvars" \
+                -var="image_tag=$(Build.BuildId)" \
+                -out=tfplan \
+                -input=false
+            displayName: 'Terraform Plan'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Publish Terraform plan as artifact ---
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Terraform Plan'
+            inputs:
+              targetPath: 'terraform/tfplan'
+              artifact: 'tfplan-$(environment)'
+
+      # --- Terraform Apply (requires approval for prod) ---
+      - job: TerraformApply
+        displayName: 'Terraform Apply'
+        dependsOn: TerraformValidate
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          # --- Install Terraform ---
+          - script: |
+              curl -fsSL https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip -o terraform.zip
+              unzip -o terraform.zip
+              sudo mv terraform /usr/local/bin/
+            displayName: 'Install Terraform'
+
+          # --- Download Terraform plan artifact ---
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Terraform Plan'
+            inputs:
+              artifact: 'tfplan-$(environment)'
+              path: 'terraform'
+
+          # --- Terraform Init ---
+          - script: |
+              cd terraform
+              terraform init \
+                -backend-config="bucket=$(tfBackendBucket)" \
+                -backend-config="key=$(environment)/terraform.tfstate" \
+                -backend-config="region=$(awsRegion)" \
+                -backend-config="dynamodb_table=$(tfBackendDynamoDBTable)" \
+                -backend-config="encrypt=true"
+            displayName: 'Terraform Init'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Terraform Apply ---
+          - script: |
+              cd terraform
+              terraform apply -auto-approve -input=false tfplan
+            displayName: 'Terraform Apply'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # --- Export Terraform Outputs ---
+          - script: |
+              cd terraform
+              echo "##vso[task.setvariable variable=albDnsName;isOutput=true]$(terraform output -raw alb_dns_name)"
+              echo "##vso[task.setvariable variable=ecsClusterName;isOutput=true]$(terraform output -raw ecs_cluster_name)"
+              echo "##vso[task.setvariable variable=ecsServiceName;isOutput=true]$(terraform output -raw ecs_service_name)"
+              echo "##vso[task.setvariable variable=ecrRepoUrl;isOutput=true]$(terraform output -raw ecr_repository_url)"
+            displayName: 'Export Terraform Outputs'
+            name: tfOutputs
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+  ##############################################################################
+  # Stage 3: DEPLOY (Dev) - Deploy to ECS
+  ##############################################################################
+  - stage: Deploy_Dev
+    displayName: 'Deploy - Dev'
+    dependsOn: Infrastructure_Dev
+    variables:
+      environment: 'dev'
+      albDnsName: $[ stageDependencies.Infrastructure_Dev.TerraformApply.outputs['tfOutputs.albDnsName'] ]
+      ecsClusterName: $[ stageDependencies.Infrastructure_Dev.TerraformApply.outputs['tfOutputs.ecsClusterName'] ]
+      ecsServiceName: $[ stageDependencies.Infrastructure_Dev.TerraformApply.outputs['tfOutputs.ecsServiceName'] ]
+      ecrRepoUrl: $[ stageDependencies.Infrastructure_Dev.TerraformApply.outputs['tfOutputs.ecrRepoUrl'] ]
+    jobs:
+      - deployment: DeployToECS
+        displayName: 'Deploy to ECS - Dev'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: 'Checkout source code'
+
+                # --- Configure AWS CLI ---
+                - script: |
+                    aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
+                    aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+                    aws configure set default.region $(awsRegion)
+                  displayName: 'Configure AWS CLI'
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                # --- Force new deployment on ECS service ---
+                - script: |
+                    echo "Deploying image tag $(imageTag) to ECS..."
+                    aws ecs update-service \
+                      --cluster $(ecsClusterName) \
+                      --service $(ecsServiceName) \
+                      --force-new-deployment \
+                      --region $(awsRegion)
+                  displayName: 'Deploy to ECS'
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                # --- Wait for service stability ---
+                - script: |
+                    echo "Waiting for ECS service to stabilize..."
+                    aws ecs wait services-stable \
+                      --cluster $(ecsClusterName) \
+                      --services $(ecsServiceName) \
+                      --region $(awsRegion)
+                    echo "ECS service is stable!"
+                  displayName: 'Wait for ECS service stability'
+                  timeoutInMinutes: 10
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                # --- Verify deployment ---
+                - script: |
+                    echo "=== ECS Service Status ==="
+                    aws ecs describe-services \
+                      --cluster $(ecsClusterName) \
+                      --services $(ecsServiceName) \
+                      --region $(awsRegion) \
+                      --query 'services[0].{Status:status,DesiredCount:desiredCount,RunningCount:runningCount,TaskDefinition:taskDefinition}' \
+                      --output table
+
+                    echo ""
+                    echo "=== Running Tasks ==="
+                    aws ecs list-tasks \
+                      --cluster $(ecsClusterName) \
+                      --service-name $(ecsServiceName) \
+                      --region $(awsRegion) \
+                      --desired-status RUNNING \
+                      --output table
+
+                    echo ""
+                    echo "=== Application Health Check ==="
+                    ALB_URL="http://$(albDnsName)"
+                    echo "Testing endpoint: ${ALB_URL}"
+
+                    for i in {1..5}; do
+                      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${ALB_URL}/health || echo "000")
+                      if [ "$HTTP_STATUS" = "200" ]; then
+                        echo "Health check PASSED (HTTP ${HTTP_STATUS})"
+                        echo "Application response:"
+                        curl -s ${ALB_URL}/ | python3 -m json.tool
+                        exit 0
+                      fi
+                      echo "Attempt ${i}/5: HTTP ${HTTP_STATUS} - Retrying in 15s..."
+                      sleep 15
+                    done
+                    echo "WARNING: Health check did not return 200 after 5 attempts"
+                    exit 1
+                  displayName: 'Verify deployment'
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                # --- Output application URL ---
+                - script: |
+                    echo "=============================================="
+                    echo "  Deployment Successful!"
+                    echo "  Application URL: http://$(albDnsName)"
+                    echo "  Environment: $(environment)"
+                    echo "  Image Tag: $(imageTag)"
+                    echo "=============================================="
+                  displayName: 'Deployment summary'
+
+  ##############################################################################
+  # Stage 4: INFRASTRUCTURE (Prod) - Provision production AWS resources
+  ##############################################################################
+  - stage: Infrastructure_Prod
+    displayName: 'Infrastructure - Prod'
+    dependsOn: Deploy_Dev
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    variables:
+      environment: 'prod'
+    jobs:
+      - job: TerraformValidate
+        displayName: 'Terraform Validate & Plan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          - script: |
+              curl -fsSL https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip -o terraform.zip
+              unzip -o terraform.zip
+              sudo mv terraform /usr/local/bin/
+            displayName: 'Install Terraform'
+
+          - script: |
+              cd terraform
+              terraform init \
+                -backend-config="bucket=$(tfBackendBucket)" \
+                -backend-config="key=$(environment)/terraform.tfstate" \
+                -backend-config="region=$(awsRegion)" \
+                -backend-config="dynamodb_table=$(tfBackendDynamoDBTable)" \
+                -backend-config="encrypt=true"
+            displayName: 'Terraform Init'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          - script: |
+              cd terraform
+              terraform validate
+            displayName: 'Terraform Validate'
+
+          - script: |
+              cd terraform
+              terraform plan \
+                -var-file="environments/$(environment).tfvars" \
+                -var="image_tag=$(Build.BuildId)" \
+                -out=tfplan \
+                -input=false
+            displayName: 'Terraform Plan'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Terraform Plan'
+            inputs:
+              targetPath: 'terraform/tfplan'
+              artifact: 'tfplan-$(environment)'
+
+      # --- Production Terraform Apply with manual approval ---
+      - job: ApprovalGate
+        displayName: 'Production Approval Gate'
+        dependsOn: TerraformValidate
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            displayName: 'Approve Production Deployment'
+            timeoutInMinutes: 1440  # 24 hours
+            inputs:
+              notifyUsers: ''
+              instructions: |
+                Review the Terraform plan for production environment.
+                Verify the changes are safe to apply before approving.
+              onTimeout: 'reject'
+
+      - job: TerraformApply
+        displayName: 'Terraform Apply - Prod'
+        dependsOn: ApprovalGate
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          - script: |
+              curl -fsSL https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip -o terraform.zip
+              unzip -o terraform.zip
+              sudo mv terraform /usr/local/bin/
+            displayName: 'Install Terraform'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download Terraform Plan'
+            inputs:
+              artifact: 'tfplan-$(environment)'
+              path: 'terraform'
+
+          - script: |
+              cd terraform
+              terraform init \
+                -backend-config="bucket=$(tfBackendBucket)" \
+                -backend-config="key=$(environment)/terraform.tfstate" \
+                -backend-config="region=$(awsRegion)" \
+                -backend-config="dynamodb_table=$(tfBackendDynamoDBTable)" \
+                -backend-config="encrypt=true"
+            displayName: 'Terraform Init'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          - script: |
+              cd terraform
+              terraform apply -auto-approve -input=false tfplan
+            displayName: 'Terraform Apply'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          - script: |
+              cd terraform
+              echo "##vso[task.setvariable variable=albDnsName;isOutput=true]$(terraform output -raw alb_dns_name)"
+              echo "##vso[task.setvariable variable=ecsClusterName;isOutput=true]$(terraform output -raw ecs_cluster_name)"
+              echo "##vso[task.setvariable variable=ecsServiceName;isOutput=true]$(terraform output -raw ecs_service_name)"
+              echo "##vso[task.setvariable variable=ecrRepoUrl;isOutput=true]$(terraform output -raw ecr_repository_url)"
+            displayName: 'Export Terraform Outputs'
+            name: tfOutputs
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+  ##############################################################################
+  # Stage 5: DEPLOY (Prod) - Deploy to production ECS
+  ##############################################################################
+  - stage: Deploy_Prod
+    displayName: 'Deploy - Prod'
+    dependsOn: Infrastructure_Prod
+    condition: succeeded()
+    variables:
+      environment: 'prod'
+      albDnsName: $[ stageDependencies.Infrastructure_Prod.TerraformApply.outputs['tfOutputs.albDnsName'] ]
+      ecsClusterName: $[ stageDependencies.Infrastructure_Prod.TerraformApply.outputs['tfOutputs.ecsClusterName'] ]
+      ecsServiceName: $[ stageDependencies.Infrastructure_Prod.TerraformApply.outputs['tfOutputs.ecsServiceName'] ]
+      ecrRepoUrl: $[ stageDependencies.Infrastructure_Prod.TerraformApply.outputs['tfOutputs.ecrRepoUrl'] ]
+    jobs:
+      - deployment: DeployToECS
+        displayName: 'Deploy to ECS - Prod'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: 'Checkout source code'
+
+                - script: |
+                    aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
+                    aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+                    aws configure set default.region $(awsRegion)
+                  displayName: 'Configure AWS CLI'
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                - script: |
+                    echo "Deploying image tag $(imageTag) to production ECS..."
+                    aws ecs update-service \
+                      --cluster $(ecsClusterName) \
+                      --service $(ecsServiceName) \
+                      --force-new-deployment \
+                      --region $(awsRegion)
+                  displayName: 'Deploy to ECS - Production'
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                - script: |
+                    echo "Waiting for production ECS service to stabilize..."
+                    aws ecs wait services-stable \
+                      --cluster $(ecsClusterName) \
+                      --services $(ecsServiceName) \
+                      --region $(awsRegion)
+                    echo "Production ECS service is stable!"
+                  displayName: 'Wait for ECS service stability'
+                  timeoutInMinutes: 15
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                - script: |
+                    echo "=== Production ECS Service Status ==="
+                    aws ecs describe-services \
+                      --cluster $(ecsClusterName) \
+                      --services $(ecsServiceName) \
+                      --region $(awsRegion) \
+                      --query 'services[0].{Status:status,DesiredCount:desiredCount,RunningCount:runningCount,TaskDefinition:taskDefinition}' \
+                      --output table
+
+                    echo ""
+                    echo "=== Production Health Check ==="
+                    ALB_URL="http://$(albDnsName)"
+                    for i in {1..5}; do
+                      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${ALB_URL}/health || echo "000")
+                      if [ "$HTTP_STATUS" = "200" ]; then
+                        echo "Production health check PASSED (HTTP ${HTTP_STATUS})"
+                        curl -s ${ALB_URL}/ | python3 -m json.tool
+                        exit 0
+                      fi
+                      echo "Attempt ${i}/5: HTTP ${HTTP_STATUS} - Retrying in 15s..."
+                      sleep 15
+                    done
+                    echo "ERROR: Production health check failed!"
+                    exit 1
+                  displayName: 'Verify production deployment'
+                  env:
+                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+                - script: |
+                    echo "=============================================="
+                    echo "  PRODUCTION Deployment Successful!"
+                    echo "  Application URL: http://$(albDnsName)"
+                    echo "  Environment: production"
+                    echo "  Image Tag: $(imageTag)"
+                    echo "=============================================="
+                  displayName: 'Production deployment summary'

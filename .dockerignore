@@ -1,0 +1,14 @@
+.git
+.gitignore
+*.md
+terraform/
+azure-pipelines.yml
+.dockerignore
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.env
+*.tfstate
+*.tfstate.backup
+.terraform/
