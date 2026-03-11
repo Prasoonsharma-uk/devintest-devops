@@ -140,18 +140,28 @@ stages:
                 .
             displayName: 'Build Docker image'
 
-          # --- Tag and push Docker image to ECR ---
+          # --- Tag and push Docker image to ECR (both dev and prod repos) ---
           - script: |
-              ECR_URI=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com/$(projectName)
+              ECR_BASE=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com
 
-              docker tag $(projectName):$(imageTag) ${ECR_URI}:$(imageTag)
-              docker tag $(projectName):latest ${ECR_URI}:latest
+              # Push to dev ECR repository
+              ECR_URI_DEV=${ECR_BASE}/$(projectName)-dev
+              docker tag $(projectName):$(imageTag) ${ECR_URI_DEV}:$(imageTag)
+              docker tag $(projectName):latest ${ECR_URI_DEV}:latest
+              docker push ${ECR_URI_DEV}:$(imageTag)
+              docker push ${ECR_URI_DEV}:latest
+              echo "Pushed to dev ECR: ${ECR_URI_DEV}:$(imageTag)"
 
-              docker push ${ECR_URI}:$(imageTag)
-              docker push ${ECR_URI}:latest
+              # Push to prod ECR repository
+              ECR_URI_PROD=${ECR_BASE}/$(projectName)-prod
+              docker tag $(projectName):$(imageTag) ${ECR_URI_PROD}:$(imageTag)
+              docker tag $(projectName):latest ${ECR_URI_PROD}:latest
+              docker push ${ECR_URI_PROD}:$(imageTag)
+              docker push ${ECR_URI_PROD}:latest
+              echo "Pushed to prod ECR: ${ECR_URI_PROD}:$(imageTag)"
 
-              echo "##vso[task.setvariable variable=ecrImageUri;isOutput=true]${ECR_URI}:$(imageTag)"
-            displayName: 'Tag & Push image to ECR'
+              echo "##vso[task.setvariable variable=ecrImageUri;isOutput=true]${ECR_URI_DEV}:$(imageTag)"
+            displayName: 'Tag & Push image to ECR (dev + prod)'
             name: pushImage
             env:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
