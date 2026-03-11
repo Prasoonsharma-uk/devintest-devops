@@ -532,6 +532,27 @@ stages:
               AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
               AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
 
+          # --- Copy image from dev ECR to prod ECR (after Terraform creates the prod ECR repo) ---
+          - script: |
+              echo "Copying image from dev ECR to prod ECR..."
+              ECR_BASE=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com
+              DEV_ECR=${ECR_BASE}/$(projectName)-dev
+              PROD_ECR=${ECR_BASE}/$(projectName)-prod
+
+              # Login to ECR
+              aws ecr get-login-password --region $(awsRegion) | \
+                docker login --username AWS --password-stdin ${ECR_BASE}
+
+              # Pull from dev, tag for prod, push to prod (build-id tag only, no 'latest' for immutable repos)
+              docker pull ${DEV_ECR}:$(imageTag)
+              docker tag ${DEV_ECR}:$(imageTag) ${PROD_ECR}:$(imageTag)
+              docker push ${PROD_ECR}:$(imageTag)
+              echo "Copied ${DEV_ECR}:$(imageTag) -> ${PROD_ECR}:$(imageTag)"
+            displayName: 'Copy image from dev ECR to prod ECR'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
           - script: |
               cd terraform
               echo "##vso[task.setvariable variable=albDnsName;isOutput=true]$(terraform output -raw alb_dns_name)"
@@ -575,27 +596,6 @@ stages:
                     aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
                     aws configure set default.region $(awsRegion)
                   displayName: 'Configure AWS CLI'
-                  env:
-                    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-                    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-
-                # --- Copy image from dev ECR to prod ECR ---
-                - script: |
-                    echo "Copying image from dev ECR to prod ECR..."
-                    ECR_BASE=$(AWS_ACCOUNT_ID).dkr.ecr.$(awsRegion).amazonaws.com
-                    DEV_ECR=${ECR_BASE}/$(projectName)-dev
-                    PROD_ECR=${ECR_BASE}/$(projectName)-prod
-
-                    # Login to ECR
-                    aws ecr get-login-password --region $(awsRegion) | \
-                      docker login --username AWS --password-stdin ${ECR_BASE}
-
-                    # Pull from dev, tag for prod, push to prod (build-id tag only, no 'latest' for immutable repos)
-                    docker pull ${DEV_ECR}:$(imageTag)
-                    docker tag ${DEV_ECR}:$(imageTag) ${PROD_ECR}:$(imageTag)
-                    docker push ${PROD_ECR}:$(imageTag)
-                    echo "Copied ${DEV_ECR}:$(imageTag) -> ${PROD_ECR}:$(imageTag)"
-                  displayName: 'Copy image from dev ECR to prod ECR'
                   env:
                     AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
                     AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
